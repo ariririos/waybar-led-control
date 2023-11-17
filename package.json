@@ -20,5 +20,6 @@
     "@js-temporal/polyfill": "^0.4.4",
     "@repeaterjs/repeater": "^3.0.5",
     "ws": "^8.14.2"
-  }
+  },
+  "type": "module"
 }
