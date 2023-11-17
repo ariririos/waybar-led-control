@@ -1,0 +1,24 @@
+{
+  "name": "waybar-led-control",
+  "version": "1.0.0",
+  "description": "Waybar module to control remote [jackw01/led-control](https://github.com/jackw01/led-control) instance",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ariririos/waybar-led-control.git"
+  },
+  "author": "Ari Rios",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/ariririos/waybar-led-control/issues"
+  },
+  "homepage": "https://github.com/ariririos/waybar-led-control#readme",
+  "dependencies": {
+    "@js-temporal/polyfill": "^0.4.4",
+    "@repeaterjs/repeater": "^3.0.5",
+    "ws": "^8.14.2"
+  }
+}
