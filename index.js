@@ -157,6 +157,8 @@ async function socketLoop() {
         }
         catch (e) {
             clearInterval(startAnimInterval);
+            ws.close();
+            ipc.close();
             if (e?.code === 'EADDRINUSE') {
                 try {
                     const lsof = await exec('lsof ' + IPC_FILE);
