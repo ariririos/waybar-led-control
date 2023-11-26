@@ -124,16 +124,16 @@ async function socketLoop() {
             for await (const msg of Repeater.merge([wsMessages, ipcMessages])) {
                 let config;
                 if (isJson(msg)) {
+                    if (startAnimInterval) {
+                        clearInterval(startAnimInterval);
+                        startAnimInterval = false;
+                    }
                     config = JSON.parse(msg);
                     if (config.on === 0) {
                         console.log('×');
                     }
                     else {
                         const palette = palettes[config.groups.main.palette] || ['#000000', '#000000', '#000000'];
-                        if (startAnimInterval) {
-                            clearInterval(startAnimInterval);
-                            startAnimInterval = false;
-                        }
                         console.log(`<span color='${palette[0]}' rise='0.1pt'></span><span color='${palette[1]}' rise='0.1pt'></span><span color='${palette[2]}' rise='0.1pt'></span> ${(config.global_brightness.toFixed(2) * 100).toFixed(0)}%`);
                     }
                     //format: if on: {  } (three circles for palette) { brightness % }
