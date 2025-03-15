@@ -1,5 +1,6 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --trace-warnings
 import WebSocket from 'ws';
+import ReconnectingWebSocket from 'reconnecting-websocket';
 import net from 'node:net';
 import { Repeater } from '@repeaterjs/repeater';
 import fs from 'node:fs/promises';
@@ -7,10 +8,17 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import process from 'node:process';
 import { Temporal } from '@js-temporal/polyfill';
+import wifi from 'node-wifi';
+
+const WS_ADDR = 'ws://aris-raspi.local:8080'; // WebSocket server attached to led-control instance
+const WIFI_SSID = 'Sugar Shack'; // only run module if on specific ssid; if empty, run always
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const exec = promisify(execCb);
 
+// led-control palette averages for the default palettes
+// should probably have a mechanism to update it whenever
+// the server has new palette info
 const palettes = {
     0: ['#ffb313', '#ff0e7e', '#467cff'],
     20: ['#ff3555', '#7b5dfe', '#0efbff'],
@@ -37,14 +45,36 @@ const palettes = {
     500: ['#ff0000', '#00ffff', '#ff0002']
 };
 
+async function ssidCheck() {
+    if (WIFI_SSID === '') return;
+    else {
+        wifi.init({ iface: 'wlp0s20f3' }); // should probably auto-detect or provide a config option
+        const connections = await wifi.getCurrentConnections();
+        if (connections.length !== 1) {
+            console.error(`Unsupported number of wifi connections (${connections.length})`);
+            process.exit(1);
+        }
+        else {
+            if (connections[0].ssid !== WIFI_SSID) {
+                console.error('Not running under unknown ssid ' + connections[0].ssid);
+                process.exit(1);
+            }
+            else return;
+        }
+    }
+}
+
 async function socketLoop() {
-    let ws, wsMessages, ipc, ipcMessages, errStream, startAnimInterval;
+    // Function-scope / loop-scope variables
+    let ws, // WebSocket for server
+        wsMessages, // Repeater for ws stream
+        ipc, // node:net server for ipc via IPC_FILE
+        ipcMessages, // Repeater for ipc stream
+        errStream, // node:fs write stream for error file (IPC_FILE + '.log')
+        startAnimInterval; 
+    // Hope no one else is using this
     const IPC_FILE = '/tmp/waybar-led';
-    const writeError = (...e) => {
-        const now = Temporal.Now.plainDateTimeISO().toString().split('.')[0];
-        if (errStream) errStream.write(`[${now}] ${e.join(' ')}\n`);
-        else console.error(`[${now}]`, ...e);
-    };
+
     try {
         const fd = await fs.open(IPC_FILE + '.log', 'a');
         errStream = fd.createWriteStream();
@@ -54,140 +84,172 @@ async function socketLoop() {
         process.exit(1);
     }
     errStream.on('error', e => { throw e; });
+
+    const writeError = (...e) => {
+        const now = Temporal.Now.plainDateTimeISO().toString().split('.')[0];
+        if (!errStream.writableEnded) errStream.write(`[${now}] ${e.join(' ')}\n`);
+        else console.error(`[${now}]`, ...e);
+    };
     const errStreamClose = signal => {
         writeError(`Quitting (${signal})`);
-        errStream?.end();
+        errStream.end();
         process.exit(0);
     }
     process.on('SIGINT', () => errStreamClose('SIGINT'));
     process.on('SIGQUIT', () => errStreamClose('SIGQUIT'));
     process.on('SIGTERM', () => errStreamClose('SIGTERM'));
-
+    process.on('exit', code => {
+        console.trace('Process exiting with code ' + code);
+    });
 
     writeError('---------');
-    while (true) {
-        writeError('Starting...');
-        try {
-            console.log('...');
-            let i = 0;
-            startAnimInterval = setInterval(() => {
-                if (i % 3 === 0) console.log('/..');
-                else if (i % 3 === 1) console.log('.-.');
-                else if (i % 3 === 2) console.log('..\\');
-                i++;
-            }, 500);
-            ws = new WebSocket('ws://raspberrypi.local:8080');
-            wsMessages = new Repeater(async(push, stop) => {
-                ws.on('message', ev => push(ev.toString()));
-                ws.on('error', e => stop(e));
-                ws.on('close', () => stop(new Error('WebSocket ended unexpectedly')));
+    writeError('Starting...');
+    
+    try {
+        console.log('...');
+        let i = 0;
+        startAnimInterval = setInterval(() => {
+            if (i % 3 === 0) console.log('/..');
+            else if (i % 3 === 1) console.log('.-.');
+            else if (i % 3 === 2) console.log('..\\');
+            i++;
+        }, 500);
+        ws = new ReconnectingWebSocket(WS_ADDR, [], { WebSocket });
+        wsMessages = new Repeater(async(push, stop) => {
+            ws.addEventListener('message', ev => push(ev.data));
+            ws.addEventListener('error', e => stop(e));
+            ws.addEventListener('close', () => stop(new Error('WebSocket ended unexpectedly')));
+            await stop;
+            ws.close();
+        });
+        ipc = net.createServer();
+        ipcMessages = new Repeater(async(push, stop) => {
+            let connections = 0, conn;
+            ipc.listen(IPC_FILE);
+            
+            ipc.on('close', () => {
+                connections = 0;
+                stop(new Error('IPC socket ended unexpectedly'));
             });
-            ipc = net.createServer();
-            ipcMessages = new Repeater(async(push, stop) => {
-                let connections = 0, conn;
-                ipc.listen(IPC_FILE);
-                
-                ipc.on('close', () => {
-                    connections = 0;
-                    stop(new Error('IPC socket ended unexpectedly'));
-                });
-                ipc.on('error', (e) => {
-                    ipc.close();
-                    stop(e);
-                });
-                ipc.on('connection', sock => {
-                    if (connections !== 0) {
-                        return;
-                    }
-                    connections++;
-                    conn = sock;
-                    conn.setEncoding('utf8');
-                    conn.on('close', () => connections--);
-                    conn.on('error', e => stop(e));
-                    conn.on('data', data => push(data));
-                });
-                await stop;
-                conn?.destroy();
-                await ipc[Symbol.asyncDispose]();
+            ipc.on('error', (e) => {
+                ipc.close();
+                stop(e);
             });
-
-            const isJson = text => {
-                try {
-                    JSON.parse(text);
-                    return true;
+            ipc.on('connection', sock => {
+                if (connections !== 0) {
+                    return;
                 }
-                catch (e) {
-                    return false;
-                }
-            };
+                connections++;
+                conn = sock;
+                conn.setEncoding('utf8');
+                conn.on('close', () => connections--);
+                conn.on('error', e => stop(e));
+                conn.on('data', data => push(data));
+            });
+            await stop;
+            conn?.destroy();
+            await ipc[Symbol.asyncDispose]();
+        });
 
-            for await (const msg of Repeater.merge([wsMessages, ipcMessages])) {
-                let config;
-                if (isJson(msg)) {
-                    if (startAnimInterval) {
-                        clearInterval(startAnimInterval);
-                        startAnimInterval = false;
-                    }
-                    config = JSON.parse(msg);
-                    if (config.on === 0) {
-                        console.log('×');
-                    }
-                    else {
-                        const palette = palettes[config.groups.main.palette] || ['#000000', '#000000', '#000000'];
-                        console.log(`<span color='${palette[0]}' rise='0.1pt'></span><span color='${palette[1]}' rise='0.1pt'></span><span color='${palette[2]}' rise='0.1pt'></span> ${(config.global_brightness.toFixed(2) * 100).toFixed(0)}%`);
-                    }
-                    //format: if on: {  } (three circles for palette) { brightness % }
-                    //format: if off: ×
+        // Returns either the parsed json or false
+        // Technically incorrect for JSON that is just the
+        // Boolean literal 'false' but irrelevant
+        
+        const isJson = text => {
+            try {
+                return JSON.parse(text);
+            }
+            catch {
+                return false;
+            }
+        };
+
+        // This loop lasts until either of these Repeaters stop
+        // sending messages, which should only happen on error
+        for await (const msg of Repeater.merge([wsMessages, ipcMessages])) {
+            let config = isJson(msg);
+            if (config !== false) {
+                if (startAnimInterval) {
+                    clearInterval(startAnimInterval);
+                    startAnimInterval = false;
+                }
+                if (config.on === 0) {
+                    console.log('×');
                 }
                 else {
-                    switch (msg) {
-                        case 'palette_up':
-                        case 'palette_down':
-                        case 'brightness_up':
-                        case 'brightness_down':
-                        case 'power':
-                            ws.send(msg);
-                            continue;
-                        default:
-                            throw new Error('Unknown IPC message ' + msg);
-                    }
+                    const palette = palettes[config.groups.main.palette] || ['#000000', '#000000', '#000000'];
+                    console.log(`<span color='${palette[0]}' rise='0.1pt'></span><span color='${palette[1]}' rise='0.1pt'></span><span color='${palette[2]}' rise='0.1pt'></span> ${(config.global_brightness.toFixed(2) * 100).toFixed(0)}%`);
                 }
+                // format: if on: {  } (three circles for palette) { brightness % }
+                // format: if off: ×
             }
-            throw new Error('Loop ended unexpectedly');
-        }
-        catch (e) {
-            clearInterval(startAnimInterval);
-            ws.close();
-            ipc.close();
-            if (e?.code === 'EADDRINUSE') {
-                try {
-                    const lsof = await exec('lsof ' + IPC_FILE);
-                    writeError('Someone else is using', IPC_FILE + '\n' + lsof.stdout);
-                }
-                catch (e) {
-                    if (e?.code === 0) { // someone else is using this socket, continue to the rest of the error handler
-                    }
-                    else { // no one else is using this socket, we can delete it
-                        writeError('Deleting old ' + IPC_FILE);
-                        await fs.rm(IPC_FILE);
+            else {
+                if (ws.readyState !== 1) throw new Error('WebSocket ended unexpectedly');
+                switch (msg) {
+                    case 'palette_up':
+                    case 'palette_down':
+                    case 'brightness_up':
+                    case 'brightness_down':
+                    case 'power':
+                        ws.send(msg);
                         continue;
-                    }
+                    default:
+                        throw new Error('Unknown IPC message ' + msg);
                 }
             }
-            writeError('main async iterator loop error', e?.code, e?.message);
-            writeError('Restarting in 10s...');
-            console.log('~~~');
         }
-        await sleep(10000);
+        // Throw if the loop ends, just in case it does
+        // without throwing on its own
+        throw new Error('Loop ended unexpectedly');
+        return;
     }
+    catch (e) {
+        // Stop the loading animation
+        clearInterval(startAnimInterval);
+        // Clean up server connections
+        ws?.close();
+        ipc?.close();
+        errStream?.end();
+        // Clean up termination listeners
+        process.removeAllListeners('SIGINT');
+        process.removeAllListeners('SIGQUIT');
+        process.removeAllListeners('SIGTERM');
+        process.removeAllListeners('exit');
+        // If the error is due to the ipc connection failing
+        // because a previous process didn't clean up properly,
+        // delete the old ipc file, but only if no other process
+        // is still using it
+        if (e?.code === 'EADDRINUSE') {
+            try {
+                const lsof = await exec('lsof ' + IPC_FILE);
+                writeError('Someone else is using', IPC_FILE + '\n' + lsof.stdout);
+            }
+            catch (e) {
+                if (e?.code === 0) { // someone else is using this socket, continue to the rest of the error handler
+                }
+                else { // no one else is using this socket, we can delete it
+                    writeError('Deleting old ' + IPC_FILE);
+                    await fs.rm(IPC_FILE); // if this fails, it requires
+                    // manual intervention anyway (a `chmod +w IPC_FILE`
+                    // should suffice)
+                    return; // breaks out of the loop (effectively a `continue`)
+                }
+            }
+        }
+        writeError('main async iterator loop error', e?.code, e?.message);
+        writeError('Restarting in 1s...');
+        console.log('~~~');
+    }
+    return sleep(1000);
 }
 
 try {
     while (true) {
+        await ssidCheck();
         await socketLoop();
     }
 }
 catch (e) {
-    console.error('Uncaught socketLoop error', e);
+    console.error('Uncaught module error', e);
     process.exit(1);
 }
