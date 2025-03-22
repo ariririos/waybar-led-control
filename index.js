@@ -1,6 +1,4 @@
 #!/usr/bin/env -S node --trace-warnings
-import WebSocket from 'ws';
-import ReconnectingWebSocket from 'reconnecting-websocket';
 import net from 'node:net';
 import { Repeater } from '@repeaterjs/repeater';
 import fs from 'node:fs/promises';
@@ -10,11 +8,18 @@ import process from 'node:process';
 import { Temporal } from '@js-temporal/polyfill';
 import wifi from 'node-wifi';
 
-const WS_ADDR = 'ws://aris-raspi.local:8080'; // WebSocket server attached to led-control instance
+const LEDCONTROL_ENDPOINT = 'aris-raspi.local'; // same as LEDControl web interface page
 const WIFI_SSID = 'Sugar Shack'; // only run module if on specific ssid; if empty, run always
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const exec = promisify(execCb);
+
+const palettesList = [
+    0, 20,  50,  51,  60,  61,
+    70,  80,  90, 100, 101, 102, 200,
+    210, 220, 230, 240, 250, 260, 270,
+    280, 290, 500
+];
 
 // led-control palette averages for the default palettes
 // should probably have a mechanism to update it whenever
@@ -45,6 +50,14 @@ const palettes = {
     500: ['#ff0000', '#00ffff', '#ff0002']
 };
 
+const post = async(data) => {
+    return await fetch('http://' + LEDCONTROL_ENDPOINT + '/updatesettings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+    });
+};
+
 async function ssidCheck() {
     if (WIFI_SSID === '') return;
     else {
@@ -66,8 +79,7 @@ async function ssidCheck() {
 
 async function socketLoop() {
     // Function-scope / loop-scope variables
-    let ws, // WebSocket for server
-        wsMessages, // Repeater for ws stream
+    let configUpdateRepeater, // Repeater for config update
         ipc, // node:net server for ipc via IPC_FILE
         ipcMessages, // Repeater for ipc stream
         errStream, // node:fs write stream for error file (IPC_FILE + '.log')
@@ -114,14 +126,6 @@ async function socketLoop() {
             else if (i % 3 === 2) console.log('..\\');
             i++;
         }, 500);
-        ws = new ReconnectingWebSocket(WS_ADDR, [], { WebSocket });
-        wsMessages = new Repeater(async(push, stop) => {
-            ws.addEventListener('message', ev => push(ev.data));
-            ws.addEventListener('error', e => stop(e));
-            ws.addEventListener('close', () => stop(new Error('WebSocket ended unexpectedly')));
-            await stop;
-            ws.close();
-        });
         ipc = net.createServer();
         ipcMessages = new Repeater(async(push, stop) => {
             let connections = 0, conn;
@@ -150,11 +154,18 @@ async function socketLoop() {
             conn?.destroy();
             await ipc[Symbol.asyncDispose]();
         });
+        configUpdateRepeater = new Repeater(async(push, stop) => {
+            setInterval(async() => {
+                try {
+                    let currentConfig = await fetch('http://' + LEDCONTROL_ENDPOINT + "/getsettings");
+                    push(await currentConfig.text());
+                }
+                catch (e) {
+                    stop(e);
+                }
+            }, 1000);
+        });
 
-        // Returns either the parsed json or false
-        // Technically incorrect for JSON that is just the
-        // Boolean literal 'false' but irrelevant
-        
         const isJson = text => {
             try {
                 return JSON.parse(text);
@@ -164,11 +175,13 @@ async function socketLoop() {
             }
         };
 
+        let currentConfig;
         // This loop lasts until either of these Repeaters stop
         // sending messages, which should only happen on error
-        for await (const msg of Repeater.merge([wsMessages, ipcMessages])) {
+        for await (const msg of Repeater.merge([configUpdateRepeater, ipcMessages])) {
             let config = isJson(msg);
             if (config !== false) {
+                currentConfig = config;
                 if (startAnimInterval) {
                     clearInterval(startAnimInterval);
                     startAnimInterval = false;
@@ -184,14 +197,21 @@ async function socketLoop() {
                 // format: if off: ×
             }
             else {
-                if (ws.readyState !== 1) throw new Error('WebSocket ended unexpectedly');
                 switch (msg) {
                     case 'palette_up':
+                        await post({ groups: { main: { palette: palettesList[palettesList.indexOf(currentConfig.groups.main.palette) + 1] ?? 0 }}});
+                        continue;
                     case 'palette_down':
+                        await post({ groups: { main: { palette: palettesList[palettesList.indexOf(currentConfig.groups.main.palette) - 1] ?? 500 }}});
+                        continue;
                     case 'brightness_up':
+                        await post({ global_brightness: currentConfig.global_brightness + 0.1 > 1 ? 1 : +(currentConfig.global_brightness + 0.1).toFixed(2) });
+                        continue;
                     case 'brightness_down':
+                        await post({ global_brightness: currentConfig.global_brightness - 0.1 < 0 ? 0 : +(currentConfig.global_brightness - 0.1).toFixed(2) });
+                        continue;
                     case 'power':
-                        ws.send(msg);
+                        await post({ on: currentConfig.on === 1 ? 0 : 1});
                         continue;
                     default:
                         throw new Error('Unknown IPC message ' + msg);
@@ -201,13 +221,11 @@ async function socketLoop() {
         // Throw if the loop ends, just in case it does
         // without throwing on its own
         throw new Error('Loop ended unexpectedly');
-        return;
     }
     catch (e) {
         // Stop the loading animation
         clearInterval(startAnimInterval);
         // Clean up server connections
-        ws?.close();
         ipc?.close();
         errStream?.end();
         // Clean up termination listeners
