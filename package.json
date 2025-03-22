@@ -19,6 +19,7 @@
   "dependencies": {
     "@js-temporal/polyfill": "^0.4.4",
     "@repeaterjs/repeater": "^3.0.5",
+    "dotenv": "^16.4.7",
     "reconnecting-websocket": "^4.4.0",
     "ws": "^8.14.2"
   },

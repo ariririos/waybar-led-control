@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --trace-warnings
+#!/usr/bin/env -S node
 import net from 'node:net';
 import { Repeater } from '@repeaterjs/repeater';
 import fs from 'node:fs/promises';
@@ -7,9 +7,7 @@ import { promisify } from 'node:util';
 import process from 'node:process';
 import { Temporal } from '@js-temporal/polyfill';
 import wifi from 'node-wifi';
-
-const LEDCONTROL_ENDPOINT = 'aris-raspi.local'; // same as LEDControl web interface page
-const WIFI_SSID = 'Sugar Shack'; // only run module if on specific ssid; if empty, run always
+import 'dotenv/config';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const exec = promisify(execCb);
@@ -51,7 +49,7 @@ const palettes = {
 };
 
 const post = async(data) => {
-    return await fetch('http://' + LEDCONTROL_ENDPOINT + '/updatesettings', {
+    return await fetch('http://' + process.env.LEDCONTROL_ENDPOINT + '/updatesettings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data)
@@ -59,7 +57,10 @@ const post = async(data) => {
 };
 
 async function ssidCheck() {
-    if (WIFI_SSID === '') return;
+    if (process.env.WIFI_SSID === '') return;
+    if (process.env.WIFI_SSID === undefined) {
+        throw new Error("undefined WIFI_SSID");
+    }
     else {
         wifi.init({ iface: 'wlp0s20f3' }); // should probably auto-detect or provide a config option
         const connections = await wifi.getCurrentConnections();
@@ -68,7 +69,7 @@ async function ssidCheck() {
             process.exit(1);
         }
         else {
-            if (connections[0].ssid !== WIFI_SSID) {
+            if (connections[0].ssid !== process.env.WIFI_SSID) {
                 console.error('Not running under unknown ssid ' + connections[0].ssid);
                 process.exit(1);
             }
@@ -157,7 +158,7 @@ async function socketLoop() {
         configUpdateRepeater = new Repeater(async(push, stop) => {
             setInterval(async() => {
                 try {
-                    let currentConfig = await fetch('http://' + LEDCONTROL_ENDPOINT + "/getsettings");
+                    let currentConfig = await fetch('http://' + process.env.LEDCONTROL_ENDPOINT + "/getsettings");
                     push(await currentConfig.text());
                 }
                 catch (e) {
